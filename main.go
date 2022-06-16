@@ -1,9 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 	"strings"
 )
@@ -11,10 +13,10 @@ import (
 type Arguments map[string]string
 
 const (
-	id        = "id"
-	item      = "item"
-	operation = "operation"
-	fName     = "fileName"
+	arg_id    = "id"
+	arg_item  = "item"
+	arg_oper  = "operation"
+	arg_fName = "fileName"
 )
 
 func Perform(args Arguments, writer io.Writer) error {
@@ -25,136 +27,219 @@ func Perform(args Arguments, writer io.Writer) error {
 	if err != nil {
 		return err
 	}
+	file, err := os.OpenFile(args[arg_fName], os.O_RDWR|os.O_APPEND|os.O_CREATE, 0o644)
+	if err != nil {
+		return err
+	}
+	bRd, err := ioutil.ReadAll(file)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	if args[arg_oper] == "list" {
+		writer.Write(bRd)
+		return nil
+	}
+	// for operations exept "list"
+	// make structure for "json-arg" from args and "json-file" from file
+	tj := newTwoJSON()
+	args.fixJSON()
+	err = tj.unmarshalMe([2][]byte{[]byte(args[arg_item]), bRd}) // {"json-arg", "json-file"}
+	if err != nil {
+		return err
+	}
+	switch args[arg_oper] {
+	case "add":
+		if id, ok := tj.isExist(tj.ids()); ok {
+			e := fmt.Sprintf("Item with id %s already exists", id)
+			writer.Write([]byte(e))
+			return nil
+		}
+		if err != nil {
+			writer.Write([]byte(err.Error()))
+			return nil
+		}
+		file.Write([]byte(args[arg_item]))
+		writer.Write([]byte(args[arg_item]))
+	case "findById":
+		if j, err := tj.find(args[arg_id]); err == nil && j != nil {
+			writer.Write(j)
+		}
+	case "remove":
+		if _, ok := tj.isExist([]string{args[arg_id]}); !ok {
+			e := fmt.Sprintf("Item with id %s not found", args[arg_id])
+			writer.Write([]byte(e))
+			return nil
+		}
+		if j, err := tj.remove(args[arg_id]); err == nil && j != nil {
+			os.Remove(args[arg_fName])
+			f, err := os.OpenFile(args[arg_fName], os.O_RDWR|os.O_APPEND|os.O_CREATE, 0o644)
+			if err != nil {
+				return err
+			}
+			f.Write(j)
+		}
+	}
 	return nil
 }
 
 func (a Arguments) validArgs() error {
 	op := map[string]string{
-		"add":      fName,
-		"list":     fName,
-		"findById": fName,
-		"remove":   fName,
+		"add":      arg_item,
+		"list":     "",
+		"findById": arg_id,
+		"remove":   arg_id,
 	}
-	for flag, value := range a {
-		v := value
-		if v[0] == '"' {
-			v = v[1:]
-		}
-		lV := len(v) - 1
-		if v[lV] == '"' {
-			v = v[:lV]
-			a[flag] = v
-		}
-		switch flag {
-		case operation:
-			if slave, ok := op[v]; ok {
-				if _, ok := a[slave]; !ok {
-					return errors.New("need filename")
-				}
-			} else {
-				return fmt.Errorf("%s flag has to be specified", flag)
+	// check flags by priority
+	for _, flag := range []string{arg_oper, arg_fName} {
+		if v, ok := a[flag]; ok {
+			err := a.valid(flag, v, op)
+			if err != nil {
+				return err
 			}
-		case fName:
-			if !strings.HasSuffix(v, ".json") {
-				return errors.New("wrong type")
-			}
+		} else {
+			return fmt.Errorf("-%s flag is missing", flag)
 		}
 	}
 	return nil
 }
 
-type args struct {
-	r         []rune
-	lR, index int
-}
-
-func (a *args) fixArgs() bool {
-	lArgs := len(os.Args)
-	if lArgs == 1 {
-		return false
+func (a Arguments) valid(flag, value string, op map[string]string) error {
+	value = strings.TrimSpace(value)
+	if len(value) == 0 {
+		return fmt.Errorf("-%s flag has to be specified", flag)
 	}
-	if lArgs == 2 && os.Args[1] == "" {
-		return false
+	if value[0] == '"' {
+		value = value[1:]
 	}
-	a.lR = needLenght()
-	a.r = make([]rune, a.lR)
-	a.index = -1
-	for _, arg := range os.Args[1:] {
-		for _, r := range arg {
-			a.index++
-			if r == '\'' || r == '«' || r == '»' || r == '‘' || r == '’' || r == '`' {
-				a.r[a.index] = '"'
-				continue
+	if len(value) == 0 {
+		return fmt.Errorf("-%s flag has to be specified", flag)
+	}
+	lV := len(value) - 1
+	if value[lV] == '"' {
+		value = value[:lV]
+		a[flag] = value
+	}
+	switch flag {
+	case arg_oper:
+		if slave, ok := op[value]; !ok {
+			if value == "" {
+				return fmt.Errorf("-%s flag has to be specified", flag)
 			}
-			a.r[a.index] = r
+			return fmt.Errorf("Operation %s not allowed!", value)
+		} else {
+			if slave == "" {
+				return nil
+			}
+			if v, ok := a[slave]; !ok || v == "" {
+				return fmt.Errorf("-%s flag has to be specified", slave)
+			}
 		}
-		a.index++
-		a.r[a.index] = ' '
+	case arg_fName:
+		if !strings.HasSuffix(value, ".json") {
+			return errors.New("wrong type")
+		}
 	}
-	return true
+	return nil
 }
 
-func (a *args) parse() Arguments {
-	arg := Arguments{}
-	flags := struct {
-		all     map[string]string
-		catched string
-		match   func(string) (string, bool)
-	}{
-		all: map[string]string{
-			"-id":          id,
-			"-item":        item,
-			"-operation":   operation,
-			"-fileName":    fName,
-			"--id":         id,
-			"--item":       item,
-			"--operation":  operation,
-			"--fileName":   fName,
-			"-id=":         id,
-			"-item=":       item,
-			"-operation=":  operation,
-			"-fileName=":   fName,
-			"--id=":        id,
-			"--item=":      item,
-			"--operation=": operation,
-			"--fileName=":  fName,
-		},
+func (a Arguments) fixJSON() {
+	if len(a[arg_item]) > 0 && a[arg_item][0] != '[' {
+		a[arg_item] = fmt.Sprintf("[%s]", a[arg_item])
 	}
-	flags.match = func(word string) (string, bool) {
-		w := strings.TrimSpace(word)
-		if flag, ok := flags.all[w]; ok {
-			return flag, true
+}
+
+type twoJSON struct {
+	m map[string]*[]sliceJSON // two key map "json-arg" and "json-file"
+}
+
+func newTwoJSON() *twoJSON {
+	return &twoJSON{
+		m: make(map[string]*[]sliceJSON),
+	}
+}
+
+type sliceJSON struct {
+	Id    string `json:"id"`
+	Email string `json:"email"`
+	Age   int    `json:"age"`
+}
+
+func (tj *twoJSON) unmarshalMe(files [2][]byte) error {
+	for i, k := range []string{"json-arg", "json-file"} {
+		err := tj.unmarshal(k, files[i])
+		if err != nil {
+			return err
 		}
+	}
+	return nil
+}
+
+func (tj *twoJSON) unmarshal(key string, file []byte) error {
+	if len(file) == 0 {
+		return nil
+	}
+	sj := []sliceJSON{}
+	err := json.Unmarshal(file, &sj)
+	if err != nil {
+		return err
+	}
+	tj.m[key] = &sj
+	return nil
+}
+
+func (tj twoJSON) ids() []string {
+	var i []string
+	for _, h := range *(tj.m["json-arg"]) { // 0 - "json-arg"
+		i = append(i, h.Id)
+	}
+	return i
+}
+
+func (tj twoJSON) isExist(ids []string) (string, bool) {
+	if _, ok := tj.m["json-file"]; !ok { // file not exist
 		return "", false
 	}
-	j := 0    // start value of flag from
-	a.index++ // adding last space for catch last value
-	for i := 0; i < len(a.r[:a.index]); i++ {
-		symbol := a.r[:a.index][i]
-		if symbol == ' ' || symbol == '=' {
-			value := string(a.r[:a.index][j:i])
-			if flag, ok := flags.match(value); ok {
-				flags.catched = flag
-				j = i + 1
-				continue
-			}
-			if flags.catched != "" {
-				arg[flags.catched] = fmt.Sprintf("%s%s", arg[flags.catched], value)
-				j = i
+	for _, i := range ids {
+		for _, g := range *(tj.m["json-file"]) { // 1 - "json-file"
+			if i == g.Id {
+				return g.Id, true
 			}
 		}
 	}
-	return arg
+	return "", false
 }
 
-func makeJSONFile() {
-}
-
-func needLenght() (n int) {
-	for _, arg := range os.Args[1:] {
-		n += len(arg)
+func (tj twoJSON) find(id string) ([]byte, error) {
+	if len(tj.m) == 0 {
+		return nil, nil
 	}
-	return n + 1 // +1 need for last space or will panic
+	// 1 - "json-file"
+	for _, g := range *(tj.m["json-file"]) {
+		if g.Id == id {
+			return json.Marshal(g)
+		}
+	}
+	return nil, nil
+}
+
+func (tj twoJSON) remove(id string) ([]byte, error) {
+	if len(tj.m) == 0 {
+		return nil, nil
+	}
+	s := []*sliceJSON{}
+	// 1 - "json-file"
+	for _, g := range *(tj.m["json-file"]) {
+		if g.Id != id {
+			s = append(s, &g)
+			// buf, err := json.Marshal(g)
+			// if err != nil {
+			// 	return nil, err
+			// }
+			// b.WriteString(string(buf))
+		}
+	}
+	return json.Marshal(s)
 }
 
 func parseArgs() Arguments {
@@ -166,8 +251,7 @@ func parseArgs() Arguments {
 }
 
 func main() {
-	os.Args = append(os.Args, `-operation «add» -item ‘{«id»: "1", «email»: «email@test.com», «age»: 23}’ --fileName «users.json»`)
-	// os.Args = append(os.Args, "")
+	// os.Args = append(os.Args, `-operation «add» -item ‘{«id»: "1", «email»: «email@test.com», «age»: 23}’ --fileName «users.json»`)
 	err := Perform(parseArgs(), os.Stdout)
 	if err != nil {
 		panic(err)
